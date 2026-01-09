@@ -9,6 +9,10 @@
 
 -include_lib("emqx_resource/include/emqx_resource.hrl").
 -include_lib("snabbkaffe/include/trace.hrl").
+-include_lib("emqx/include/emqx.hrl").
+
+%% OpenTelemetry
+-include_lib("opentelemetry_api/include/otel_tracer.hrl").
 
 %% callbacks of behaviour emqx_resource
 -export([
@@ -512,22 +516,62 @@ render_message(
         headers_tokens := KafkaHeadersTokens,
         ext_headers_tokens := KafkaExtHeadersTokens,
         headers_val_encode_mode := KafkaHeadersValEncodeMode
-    },
+    } = Config,
     Message
 ) ->
-    ExtHeaders = proc_ext_headers(KafkaExtHeadersTokens, Message),
-    KafkaHeaders =
-        case KafkaHeadersTokens of
-            undefined -> ExtHeaders;
-            HeadersTks -> merge_kafka_headers(HeadersTks, ExtHeaders, Message)
+    %% Extract existing headers from Message
+    MsgHeaders = maps:get(headers, Message, #{}),
+
+    %% Extract OTel Context
+    Ctx = otel_propagator_text_map:extract(MsgHeaders),
+
+    %% Attach OTel Context
+    Token =
+        case otel_tracer:current_span_ctx(Ctx) of
+            undefined -> undefined;
+            _ -> otel_ctx:attach(Ctx)
         end,
-    Headers = formalize_kafka_headers(KafkaHeaders, KafkaHeadersValEncodeMode),
-    #{
-        key => render(KeyTemplate, Message),
-        value => render(ValueTemplate, Message),
-        headers => Headers,
-        ts => render_timestamp(TimestampTemplate, Message)
-    }.
+
+    try
+        ?with_span(
+            <<"broker.bridge_kafka.producer.render_message">>,
+            #{
+                attributes => #{
+                    <<"messaging.system">> => <<"kafka">>,
+                    <<"messaging.destination">> => maps:get(topic, Config, <<"unknown">>)
+                }
+            },
+            fun(_SpanCtx) ->
+                %% Original render_message code
+                ExtHeaders = proc_ext_headers(KafkaExtHeadersTokens, Message),
+                KafkaHeaders =
+                    case KafkaHeadersTokens of
+                        undefined -> ExtHeaders;
+                        HeadersTks -> merge_kafka_headers(HeadersTks, ExtHeaders, Message)
+                    end,
+
+                ExistingHeaders = formalize_kafka_headers(KafkaHeaders, KafkaHeadersValEncodeMode),
+
+                %% Inject OTel trace headers
+                TraceHeaders = otel_propagator_text_map:inject([]),
+
+                %% Merge headers
+                FinalHeaders = ExistingHeaders ++ TraceHeaders,
+
+                #{
+                    key => render(KeyTemplate, Message),
+                    value => render(ValueTemplate, Message),
+                    headers => FinalHeaders,
+                    ts => render_timestamp(TimestampTemplate, Message)
+                }
+            end
+        )
+    after
+        case Token of
+            undefined -> ok;
+            _ -> otel_ctx:detach(Token)
+        end
+    end.
 
 render(Template, Message) ->
     Opts = #{
