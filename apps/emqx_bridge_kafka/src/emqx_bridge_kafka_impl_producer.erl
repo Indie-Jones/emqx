@@ -344,138 +344,215 @@ on_query(
     {MessageTag, Message},
     #{installed_bridge_v2s := BridgeV2Configs} = _ConnectorState
 ) ->
-    #{
-        message_template := MessageTemplate,
-        topic_template := TopicTemplate,
-        producers := Producers,
-        sync_query_timeout := SyncTimeout,
-        headers_tokens := KafkaHeadersTokens,
-        ext_headers_tokens := KafkaExtHeadersTokens,
-        headers_val_encode_mode := KafkaHeadersValEncodeMode
-    } = maps:get(MessageTag, BridgeV2Configs),
-    KafkaHeaders = #{
-        headers_tokens => KafkaHeadersTokens,
-        ext_headers_tokens => KafkaExtHeadersTokens,
-        headers_val_encode_mode => KafkaHeadersValEncodeMode
-    },
+    %% Extract existing headers from Message
+    RawMsgHeaders = maps:get(headers, Message, #{}),
+    MsgHeadersList = case is_map(RawMsgHeaders) of
+        true -> maps:to_list(RawMsgHeaders);
+        false -> RawMsgHeaders
+    end,
+
+    %% Convert Binary Keys to Strings for OTel Extraction
+    Carrier = lists:map(
+        fun({K, V}) ->
+            KeyStr = if is_binary(K) -> binary_to_list(K); true -> K end,
+            {KeyStr, V}
+        end,
+        MsgHeadersList
+    ),
+
+    %% Extract and Attach OTel Context
+    Ctx = otel_propagator_text_map:extract(Carrier),
+    Token =
+        case otel_tracer:current_span_ctx(Ctx) of
+            undefined -> undefined;
+            _ -> otel_ctx:attach(Ctx)
+        end,
+
     try
-        KafkaTopic = render_topic(TopicTemplate, Message),
-        KafkaMessage = render_message(MessageTemplate, KafkaHeaders, Message),
-        ?tp(
-            emqx_bridge_kafka_impl_producer_sync_query,
-            #{headers_config => KafkaHeaders, instance_id => InstId}
-        ),
-        emqx_trace:rendered_action_template(MessageTag, #{
-            message => KafkaMessage
-        }),
-        do_send_msg(sync, KafkaTopic, KafkaMessage, Producers, SyncTimeout)
-    catch
-        throw:bad_topic ->
-            ?tp("kafka_producer_failed_to_render_topic", #{}),
-            {error, {unrecoverable_error, failed_to_render_topic}};
-        throw:#{cause := unknown_topic_or_partition, topic := Topic} ->
-            ?tp("kafka_producer_resolved_to_unknown_topic", #{}),
-            {error, {unrecoverable_error, {resolved_to_unknown_topic, Topic}}};
-        throw:#{cause := invalid_partition_count, count := Count} ->
-            ?tp("kafka_producer_invalid_partition_count", #{
-                action_id => MessageTag,
-                query_mode => sync
-            }),
-            {error, {unrecoverable_error, {invalid_partition_count, Count}}};
-        throw:{bad_kafka_header, _} = Error ->
-            ?tp(
-                emqx_bridge_kafka_impl_producer_sync_query_failed,
-                #{
-                    headers_config => KafkaHeaders,
-                    instance_id => InstId,
-                    reason => Error
+        ?with_span(
+            <<"broker.bridge_kafka.producer.on_query">>,
+            #{
+                attributes => #{
+                    <<"messaging.system">> => <<"kafka">>
                 }
-            ),
-            {error, {unrecoverable_error, Error}};
-        throw:{bad_kafka_headers, _} = Error ->
-            ?tp(
-                emqx_bridge_kafka_impl_producer_sync_query_failed,
+            },
+            fun(_SpanCtx) ->
                 #{
-                    headers_config => KafkaHeaders,
-                    instance_id => InstId,
-                    reason => Error
-                }
-            ),
-            {error, {unrecoverable_error, Error}}
+                    message_template := MessageTemplate,
+                    topic_template := TopicTemplate,
+                    producers := Producers,
+                    sync_query_timeout := SyncTimeout,
+                    headers_tokens := KafkaHeadersTokens,
+                    ext_headers_tokens := KafkaExtHeadersTokens,
+                    headers_val_encode_mode := KafkaHeadersValEncodeMode
+                } = maps:get(MessageTag, BridgeV2Configs),
+                KafkaHeaders = #{
+                    headers_tokens => KafkaHeadersTokens,
+                    ext_headers_tokens => KafkaExtHeadersTokens,
+                    headers_val_encode_mode => KafkaHeadersValEncodeMode
+                },
+                try
+                    KafkaTopic = render_topic(TopicTemplate, Message),
+                    KafkaMessage = render_message(MessageTemplate, KafkaHeaders, Message),
+                    ?tp(
+                        emqx_bridge_kafka_impl_producer_sync_query,
+                        #{headers_config => KafkaHeaders, instance_id => InstId}
+                    ),
+                    emqx_trace:rendered_action_template(MessageTag, #{
+                        message => KafkaMessage
+                    }),
+                    do_send_msg(sync, KafkaTopic, KafkaMessage, Producers, SyncTimeout)
+                catch
+                    throw:bad_topic ->
+                        ?tp("kafka_producer_failed_to_render_topic", #{}),
+                        {error, {unrecoverable_error, failed_to_render_topic}};
+                    throw:#{cause := unknown_topic_or_partition, topic := Topic} ->
+                        ?tp("kafka_producer_resolved_to_unknown_topic", #{}),
+                        {error, {unrecoverable_error, {resolved_to_unknown_topic, Topic}}};
+                    throw:#{cause := invalid_partition_count, count := Count} ->
+                        ?tp("kafka_producer_invalid_partition_count", #{
+                            action_id => MessageTag,
+                            query_mode => sync
+                        }),
+                        {error, {unrecoverable_error, {invalid_partition_count, Count}}};
+                    throw:{bad_kafka_header, _} = Error ->
+                        ?tp(
+                            emqx_bridge_kafka_impl_producer_sync_query_failed,
+                            #{
+                                headers_config => KafkaHeaders,
+                                instance_id => InstId,
+                                reason => Error
+                            }
+                        ),
+                        {error, {unrecoverable_error, Error}};
+                    throw:{bad_kafka_headers, _} = Error ->
+                        ?tp(
+                            emqx_bridge_kafka_impl_producer_sync_query_failed,
+                            #{
+                                headers_config => KafkaHeaders,
+                                instance_id => InstId,
+                                reason => Error
+                            }
+                        ),
+                        {error, {unrecoverable_error, Error}}
+                end
+            end
+        )
+    after
+        case Token of
+            undefined -> ok;
+            _ -> otel_ctx:detach(Token)
+        end
     end.
 
 on_get_channels(ResId) ->
     emqx_bridge_v2:get_channels_for_connector(ResId).
 
 %% @doc The callback API for rule-engine (or bridge without rules)
-%% The input argument `Message' is an enriched format (as a map())
-%% of the original #message{} record.
-%% The enrichment is done by rule-engine or by the data bridge framework.
-%% E.g. the output of rule-engine process chain
-%% or the direct mapping from an MQTT message.
 on_query_async(
     InstId,
     {MessageTag, Message},
     AsyncReplyFn,
     #{installed_bridge_v2s := BridgeV2Configs} = _ConnectorState
 ) ->
-    #{
-        message_template := Template,
-        topic_template := TopicTemplate,
-        producers := Producers,
-        headers_tokens := KafkaHeadersTokens,
-        ext_headers_tokens := KafkaExtHeadersTokens,
-        headers_val_encode_mode := KafkaHeadersValEncodeMode
-    } = maps:get(MessageTag, BridgeV2Configs),
-    KafkaHeaders = #{
-        headers_tokens => KafkaHeadersTokens,
-        ext_headers_tokens => KafkaExtHeadersTokens,
-        headers_val_encode_mode => KafkaHeadersValEncodeMode
-    },
+    %% Extract existing headers from Message
+    RawMsgHeaders = maps:get(headers, Message, #{}),
+    MsgHeadersList = case is_map(RawMsgHeaders) of
+        true -> maps:to_list(RawMsgHeaders);
+        false -> RawMsgHeaders
+    end,
+
+    %% Convert Binary Keys to Strings for OTel Extraction
+    Carrier = lists:map(
+        fun({K, V}) ->
+            KeyStr = if is_binary(K) -> binary_to_list(K); true -> K end,
+            {KeyStr, V}
+        end,
+        MsgHeadersList
+    ),
+
+    %% Extract and Attach OTel Context
+    Ctx = otel_propagator_text_map:extract(Carrier),
+    Token =
+        case otel_tracer:current_span_ctx(Ctx) of
+            undefined -> undefined;
+            _ -> otel_ctx:attach(Ctx)
+        end,
+
     try
-        KafkaTopic = render_topic(TopicTemplate, Message),
-        KafkaMessage = render_message(Template, KafkaHeaders, Message),
-        ?tp(
-            emqx_bridge_kafka_impl_producer_async_query,
-            #{headers_config => KafkaHeaders, instance_id => InstId}
-        ),
-        emqx_trace:rendered_action_template(MessageTag, #{
-            message => KafkaMessage
-        }),
-        do_send_msg(async, KafkaTopic, KafkaMessage, Producers, AsyncReplyFn)
-    catch
-        throw:bad_topic ->
-            ?tp("kafka_producer_failed_to_render_topic", #{}),
-            {error, {unrecoverable_error, failed_to_render_topic}};
-        throw:#{cause := unknown_topic_or_partition, topic := Topic} ->
-            ?tp("kafka_producer_resolved_to_unknown_topic", #{}),
-            {error, {unrecoverable_error, {resolved_to_unknown_topic, Topic}}};
-        throw:#{cause := invalid_partition_count, count := Count} ->
-            ?tp("kafka_producer_invalid_partition_count", #{
-                action_id => MessageTag,
-                query_mode => async
-            }),
-            {error, {unrecoverable_error, {invalid_partition_count, Count}}};
-        throw:{bad_kafka_header, _} = Error ->
-            ?tp(
-                emqx_bridge_kafka_impl_producer_async_query_failed,
-                #{
-                    headers_config => KafkaHeaders,
-                    instance_id => InstId,
-                    reason => Error
+        ?with_span(
+            <<"broker.bridge_kafka.producer.on_query_async">>,
+            #{
+                attributes => #{
+                    <<"messaging.system">> => <<"kafka">>
                 }
-            ),
-            {error, {unrecoverable_error, Error}};
-        throw:{bad_kafka_headers, _} = Error ->
-            ?tp(
-                emqx_bridge_kafka_impl_producer_async_query_failed,
+            },
+            fun(_SpanCtx) ->
                 #{
-                    headers_config => KafkaHeaders,
-                    instance_id => InstId,
-                    reason => Error
-                }
-            ),
-            {error, {unrecoverable_error, Error}}
+                    message_template := Template,
+                    topic_template := TopicTemplate,
+                    producers := Producers,
+                    headers_tokens := KafkaHeadersTokens,
+                    ext_headers_tokens := KafkaExtHeadersTokens,
+                    headers_val_encode_mode := KafkaHeadersValEncodeMode
+                } = maps:get(MessageTag, BridgeV2Configs),
+                KafkaHeaders = #{
+                    headers_tokens => KafkaHeadersTokens,
+                    ext_headers_tokens => KafkaExtHeadersTokens,
+                    headers_val_encode_mode => KafkaHeadersValEncodeMode
+                },
+                try
+                    KafkaTopic = render_topic(TopicTemplate, Message),
+                    KafkaMessage = render_message(Template, KafkaHeaders, Message),
+                    ?tp(
+                        emqx_bridge_kafka_impl_producer_async_query,
+                        #{headers_config => KafkaHeaders, instance_id => InstId}
+                    ),
+                    emqx_trace:rendered_action_template(MessageTag, #{
+                        message => KafkaMessage
+                    }),
+                    do_send_msg(async, KafkaTopic, KafkaMessage, Producers, AsyncReplyFn)
+                catch
+                    throw:bad_topic ->
+                        ?tp("kafka_producer_failed_to_render_topic", #{}),
+                        {error, {unrecoverable_error, failed_to_render_topic}};
+                    throw:#{cause := unknown_topic_or_partition, topic := Topic} ->
+                        ?tp("kafka_producer_resolved_to_unknown_topic", #{}),
+                        {error, {unrecoverable_error, {resolved_to_unknown_topic, Topic}}};
+                    throw:#{cause := invalid_partition_count, count := Count} ->
+                        ?tp("kafka_producer_invalid_partition_count", #{
+                            action_id => MessageTag,
+                            query_mode => async
+                        }),
+                        {error, {unrecoverable_error, {invalid_partition_count, Count}}};
+                    throw:{bad_kafka_header, _} = Error ->
+                        ?tp(
+                            emqx_bridge_kafka_impl_producer_async_query_failed,
+                            #{
+                                headers_config => KafkaHeaders,
+                                instance_id => InstId,
+                                reason => Error
+                            }
+                        ),
+                        {error, {unrecoverable_error, Error}};
+                    throw:{bad_kafka_headers, _} = Error ->
+                        ?tp(
+                            emqx_bridge_kafka_impl_producer_async_query_failed,
+                            #{
+                                headers_config => KafkaHeaders,
+                                instance_id => InstId,
+                                reason => Error
+                            }
+                        ),
+                        {error, {unrecoverable_error, Error}}
+                end
+            end
+        )
+    after
+        case Token of
+            undefined -> ok;
+            _ -> otel_ctx:detach(Token)
+        end
     end.
 
 compile_message_template(T) ->
@@ -520,10 +597,25 @@ render_message(
     Message
 ) ->
     %% Extract existing headers from Message
-    MsgHeaders = maps:get(headers, Message, #{}),
+    RawMsgHeaders = maps:get(headers, Message, #{}),
+
+    %% Ensure it is a list for the map function
+    MsgHeadersList = case is_map(RawMsgHeaders) of
+        true -> maps:to_list(RawMsgHeaders);
+        false -> RawMsgHeaders
+    end,
+
+    %% Convert Binary Keys to Strings for OTel Extraction
+    Carrier = lists:map(
+        fun({K, V}) ->
+            KeyStr = if is_binary(K) -> binary_to_list(K); true -> K end,
+            {KeyStr, V}
+        end,
+        MsgHeadersList
+    ),
 
     %% Extract OTel Context
-    Ctx = otel_propagator_text_map:extract(MsgHeaders),
+    Ctx = otel_propagator_text_map:extract(Carrier),
 
     %% Attach OTel Context
     Token =
@@ -552,8 +644,16 @@ render_message(
 
                 ExistingHeaders = formalize_kafka_headers(KafkaHeaders, KafkaHeadersValEncodeMode),
 
-                %% Inject OTel trace headers
-                TraceHeaders = otel_propagator_text_map:inject([]),
+                %% Inject OTel trace headers (Returns list of strings e.g. [{"traceparent", "...""}])
+                RawTraceHeaders = otel_propagator_text_map:inject([]),
+
+                %% Convert OTel String headers to Binaries for Kafka
+                TraceHeaders = lists:map(
+                    fun({K, V}) ->
+                        {iolist_to_binary(K), iolist_to_binary(V)}
+                    end,
+                    RawTraceHeaders
+                ),
 
                 %% Merge headers
                 FinalHeaders = ExistingHeaders ++ TraceHeaders,

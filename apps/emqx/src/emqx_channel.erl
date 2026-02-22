@@ -432,83 +432,14 @@ handle_in(?PACKET(Type), Channel = #channel{conn_state = ConnState}) when
 ->
     ?TRACE("MQTT", "unexpected_packet", #{type => Type, conn_state => ConnState}),
     handle_out(disconnect, ?RC_PROTOCOL_ERROR, Channel);
-handle_in(?PUBLISH_PACKET(_QoS, Topic, _PacketId, Properties, _Payload) = Packet, Channel) ->
+handle_in(?PUBLISH_PACKET(_QoS, _Topic, _PacketId) = Packet, Channel) ->
     case emqx_packet:check(Packet) of
         ok ->
-            UserProps = maps:get('User-Property', Properties, []),
-
-            %% Convert Binary Keys to Strings for OTel
-            %% The extractor often fails silently if keys are binaries (<<"traceparent">>).
-            %% We convert [{<<"traceparent">>, Val}] -> [{"traceparent", Val}]
-            Carrier = lists:map(
-                fun({K, V}) ->
-                    {binary_to_list(K), V}
-                end,
-                UserProps
-            ),
-
-            ParentCtx = otel_propagator_text_map:extract(Carrier),
-
-            %% Attach Parent Context (if any)
-            Token =
-                case otel_tracer:current_span_ctx(ParentCtx) of
-                    undefined -> undefined;
-                    _ -> otel_ctx:attach(ParentCtx)
-                end,
-
-            try
-                ?with_span(
-                    <<"process_publish_packet">>,
-                    #{
-                        attributes => #{
-                            <<"messaging.destination">> => Topic,
-                            <<"mqtt.packet.type">> => <<"PUBLISH">>
-                        }
-                    },
-                    fun(_SpanCtx) ->
-                        %% Inject current context into new headers
-                        NewHeaders = otel_propagator_text_map:inject([]),
-
-                        %% Convert OTel String headers back to MQTT Binary User Properties
-                        %% [{"traceparent", "00-..."}] -> [{<<"traceparent">>, <<"00-...">>}]
-                        NewUserProps = lists:map(
-                            fun({K, V}) ->
-                                {iolist_to_binary(K), iolist_to_binary(V)}
-                            end,
-                            NewHeaders
-                        ),
-
-                        %% Filter out old traceparent to avoid duplicates
-                        CleanProps = lists:filter(
-                            fun({K, _}) ->
-                                K =/= <<"traceparent">>
-                            end,
-                            UserProps
-                        ),
-
-                        %% Merge Properties
-                        FinalUserProps = CleanProps ++ NewUserProps,
-
-                        %% Update MQTT Packet
-                        #mqtt_packet{variable = Variable} = Packet,
-                        NewProperties = maps:put('User-Property', FinalUserProps, Properties),
-                        NewVariable = Variable#mqtt_packet_publish{properties = NewProperties},
-                        NewPacket = Packet#mqtt_packet{variable = NewVariable},
-
-                        %% (Original Publish Code)
-                        ?EXT_TRACE_CLIENT_PUBLISH(
-                            ?EXT_TRACE_ATTR((basic_attrs(Channel))#{'message.topic' => Topic}),
-                            fun(_) -> process_publish(NewPacket, Channel) end,
-                            [NewPacket]
-                        )
-                    end
-                )
-            after
-                case Token of
-                    undefined -> ok;
-                    _ -> otel_ctx:detach(Token)
-                end
-            end;
+            ?EXT_TRACE_CLIENT_PUBLISH(
+                ?EXT_TRACE_ATTR((basic_attrs(Channel))#{'message.topic' => _Topic}),
+                fun(NPacket) -> process_publish(NPacket, Channel) end,
+                [Packet]
+            );
         {error, ReasonCode} ->
             ?TRACE("MQTT", "invalid_publish_packet", #{reason => emqx_reason_codes:name(ReasonCode)}),
             handle_out(disconnect, ReasonCode, Channel)
